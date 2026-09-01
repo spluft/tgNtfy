@@ -25,6 +25,7 @@ import (
 	"github.com/spluft/tgNtfy/internal/menu"
 	"github.com/spluft/tgNtfy/internal/store"
 	"github.com/spluft/tgNtfy/internal/tgbot"
+	"github.com/spluft/tgNtfy/internal/topic"
 	"github.com/spluft/tgNtfy/internal/transport"
 )
 
@@ -87,10 +88,16 @@ func runServer() error {
 	}
 	defer st.Close()
 
-	// Catalog.
+	// Catalog (OPTIONAL hints only, V-6/D-CAT-1). An absent file is the normal state —
+	// the gate runs severity-hint-less — so that is logged at debug, not warned. A real
+	// parse/validation error still warns and continues with an empty catalog.
 	cat, err := catalog.Load(catalogPath)
 	if err != nil {
-		log.Warn("catalog load failed; starting with empty catalog", "err", err)
+		if errors.Is(err, os.ErrNotExist) {
+			log.Debug("no catalog file; running without severity hints", "path", catalogPath)
+		} else {
+			log.Warn("catalog load failed; starting with empty catalog", "err", err)
+		}
 		cat = &catalog.Catalog{Version: 1}
 		if cat.Services == nil {
 			cat.Services = map[string]catalog.Service{}
@@ -98,9 +105,6 @@ func runServer() error {
 	}
 	catLk := catalog.NewLookup(cat)
 	catLk.SetPath(catalogPath)
-	for svc, s := range cat.Services {
-		_ = st.EnsureRegistered(context.Background(), svc, s.DisplayName)
-	}
 
 	// TG client + menu handler.
 	client, err := tgbot.New(os.Getenv("TG_BOT_TOKEN"), os.Getenv("TG_API_URL"), nil)
@@ -110,18 +114,15 @@ func runServer() error {
 	menuH := menu.NewHandler(client, st, catLk, log)
 	client.SetHandler(menuH.DefaultHandler)
 
-	// Topic resolver: group-delivery topic lookup + lazy createForumTopic.
+	// Topic resolver: lazy createForumTopic only on a group_topics miss (the store's
+	// EnsureTopic does the row-first lookup + idempotent row upsert). Name source is the
+	// store's services.display_name (V-1/V-5), never the catalog; fallback: service id.
 	topicResolver := func(cm context.Context, userID, chatID int64, svc string) (int, error) {
-		disp := svc
-		if s, ok := cat.Services[svc]; ok && s.DisplayName != "" {
-			disp = s.DisplayName
+		disp, _ := st.DisplayName(cm, svc)
+		if name := topic.SanitizeTopicName(disp); name != "" {
+			disp = name
 		}
-		tid, err := client.CreateTopic(cm, chatID, disp)
-		if err != nil {
-			return 0, err
-		}
-		_ = st.SetTopic(context.Background(), userID, svc, tid)
-		return tid, nil
+		return client.CreateTopic(cm, chatID, disp)
 	}
 
 	// Dispatcher.
@@ -208,9 +209,10 @@ func (b *batchFlusher) Flush(ctx context.Context, key coalesce.Key, items []*coa
 			threadID = tid
 		}
 	}
-	text := ingest.RenderMessage(ev.Severity, key.Service, key.Type, ev.Title, ev.Text, ev.URL)
+	disp, _ := b.store.DisplayName(ctx, key.Service)
+	text := ingest.RenderMessage(ev.Severity, disp, key.Type, ev.Title, ev.Text, ev.URL)
 	if len(items) > 1 {
-		text = ingest.RenderBatch(ev.Severity, key.Service, key.Type, items)
+		text = ingest.RenderBatch(ev.Severity, disp, key.Type, items)
 	}
 	rowID, err := b.store.CreateDelivery(ctx, ev.UserID, chatID, threadID, ev.EventID, key.Service, key.Type, len(items))
 	if err != nil {

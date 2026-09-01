@@ -248,10 +248,26 @@ func (s *Store) CreateTokenlessService(ctx context.Context, service, displayName
 
 // --- service_users + subscriptions ---
 
+// execer is satisfied by both *sql.DB and *sql.Tx so the display_name UPDATE runs inside
+// the LinkIdentity transaction or standalone.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// setServiceDisplayNameIn updates services.display_name inside the caller's tx (V-2).
+func setServiceDisplayNameIn(e execer, ctx context.Context, service, name string) error {
+	_, err := e.ExecContext(ctx,
+		`UPDATE services SET display_name=? WHERE service=?`, name, service)
+	return err
+}
+
 // LinkIdentity binds (service,user_ref) to a TG user and ensures a subscription row,
 // atomically consuming a link code (UC-2). Returns ErrDuplicateEvent for constraint
 // failures and consumes the code ONLY within the same transaction.
-func (s *Store) LinkIdentity(ctx context.Context, service, userRef, code string, codeUserID, tgUserID int64) error {
+//
+// displayName is OPTIONAL (V-2): when non-empty it updates services.display_name inside the
+// same transaction (the service self-names at link); when empty the existing name is kept.
+func (s *Store) LinkIdentity(ctx context.Context, service, userRef, code string, codeUserID, tgUserID int64, displayName string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -316,6 +332,11 @@ func (s *Store) LinkIdentity(ctx context.Context, service, userRef, code string,
 		tgUserID, service, now)
 	if err != nil {
 		return err
+	}
+	if displayName != "" {
+		if err := setServiceDisplayNameIn(tx, ctx, service, displayName); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -398,10 +419,11 @@ func (s *Store) ResolveRoutes(ctx context.Context, e *Event, resolveTopic TopicR
 		rt := RouteTarget{UserID: uid, Mode: mode}
 		switch {
 		case mode == "group" && gci.Valid:
-			tid, err := resolveTopic(ctx, uid, gci.Int64, e.Service)
+			tid, _, err := s.EnsureTopic(ctx, uid, gci.Int64, e.Service,
+				func(chatID int64, svc string) (int, error) { return resolveTopic(ctx, uid, chatID, svc) })
 			if err != nil {
-				// Lazy-create failed; still enqueue a DM? No - group lack is a delivery error.
-				// We enqueue to group chat with thread 0 so retry can re-create topic.
+				// Lazy-create failed; enqueue to group chat with thread 0 so the retry
+				// re-creates the topic via the same idempotent path (E-11).
 				rt.ChatID = gci.Int64
 				rt.ThreadID = 0
 				out = append(out, rt)
@@ -420,31 +442,64 @@ func (s *Store) ResolveRoutes(ctx context.Context, e *Event, resolveTopic TopicR
 
 // --- group_topics ---
 
-// GetOrCreateTopic returns the topic id for (user,service), creating via resolver if absent.
-func (s *Store) GetOrCreateTopic(ctx context.Context, userID, chatID int64, service string, resolver func(chatID int64, service string) (int, error)) (int, error) {
+// EnsureTopic returns the idempotent topic id for (user,service) (D-IDEM-1): if a
+// group_topics row already exists it is reused (created=false, no Bot API call); else the
+// creator callback creates the forum topic and the row is upserted with ON CONFLICT DO
+// NOTHING (a concurrent racer may win — its thread id wins, ours is an orphan, tolerated).
+// creator is injected so the store never imports tgbot.
+func (s *Store) EnsureTopic(ctx context.Context, userID, chatID int64, service string, creator func(chatID int64, service string) (int, error)) (threadID int, created bool, err error) {
 	{
 		var tid int
 		err := s.db.QueryRowContext(ctx,
 			`SELECT message_thread_id FROM group_topics WHERE user_id=? AND service=?`, userID, service).Scan(&tid)
 		if err == nil {
-			return tid, nil
+			return tid, false, nil
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
-			return 0, err
+			return 0, false, err
 		}
 	}
-	tid, err := resolver(chatID, service)
+	tid, err := creator(chatID, service)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO group_topics (user_id, service, message_thread_id, created_at)
 		VALUES (?,?,?,?) ON CONFLICT(user_id, service) DO NOTHING`,
 		userID, service, tid, time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
-		return 0, err
+		return 0, true, err
 	}
-	return tid, nil
+	return tid, true, nil
+}
+
+// SetServiceDisplayName updates a service's display name (admin/CLI/tests, V-2).
+func (s *Store) SetServiceDisplayName(ctx context.Context, service, name string) error {
+	return setServiceDisplayNameIn(s.db, ctx, service, name)
+}
+
+// DisplayName returns a service's display name, falling back to the service id when the
+// service row does not exist (safe for the resolver/renderer when no catalog is present).
+func (s *Store) DisplayName(ctx context.Context, service string) (string, error) {
+	var dn string
+	err := s.db.QueryRowContext(ctx, `SELECT display_name FROM services WHERE service=?`, service).Scan(&dn)
+	if errors.Is(err, sql.ErrNoRows) {
+		return service, nil
+	}
+	if err != nil {
+		return service, err
+	}
+	if dn == "" {
+		return service, nil
+	}
+	return dn, nil
+}
+
+// ClearUserTopics deletes all of a user's group_topics rows (V-9): a new group bind
+// means old message_thread_ids point at the previous chat and would 403 on delivery.
+func (s *Store) ClearUserTopics(ctx context.Context, userID int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM group_topics WHERE user_id=?`, userID)
+	return err
 }
 
 // --- deliveries ---
