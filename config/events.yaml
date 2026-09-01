@@ -1,0 +1,23 @@
+version: 1
+services:
+  goyoutube:
+    display_name: goYouTube
+    events:
+      job_completed:  {severity: success}
+      job_failed:     {severity: error}
+      job_cancelled:  {severity: info}
+  gomail:
+    display_name: Mail
+    events:
+      new-mail:       {severity: info}
+      sync-status:    {severity: warn}
+  gorecomendarr:
+    display_name: Recomendarr
+    events:
+      download_completed: {severity: success}
+      job_failed:         {severity: error}
+  govpn:
+    display_name: VPN
+    events:
+      vpn_connected:    {severity: success}
+      vpn_disconnected: {severity: error}
