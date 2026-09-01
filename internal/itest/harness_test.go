@@ -22,6 +22,7 @@ import (
 	"github.com/spluft/tgNtfy/internal/menu"
 	"github.com/spluft/tgNtfy/internal/store"
 	"github.com/spluft/tgNtfy/internal/tgbot"
+	"github.com/spluft/tgNtfy/internal/topic"
 	"github.com/spluft/tgNtfy/internal/transport"
 )
 
@@ -90,18 +91,16 @@ func newHarness(t *testing.T, mock *mockBot, o *harnessOpts) *harness {
 	go disp.Run()
 	t.Cleanup(disp.Stop)
 
-	// topicResolver mirrors main.go: create (or look up) the forum topic for (user,service).
+	// topicResolver mirrors main.go (V-1/V-5): the forum topic name comes from the
+	// STORE's services.display_name (sanitized; fallback: the service id), NEVER the
+	// catalog. store.EnsureTopic performs the row-first lookup + idempotent row upsert,
+	// so this callback only creates the topic on a group_topics miss.
 	resolver := func(cm context.Context, userID, chatID int64, svc string) (int, error) {
-		dispName := svc
-		if s, ok := c.Services[svc]; ok && s.DisplayName != "" {
-			dispName = s.DisplayName
+		dispName, _ := st.DisplayName(cm, svc)
+		if name := topic.SanitizeTopicName(dispName); name != "" {
+			dispName = name
 		}
-		tid, err := client.CreateTopic(cm, chatID, dispName)
-		if err != nil {
-			return 0, err
-		}
-		_ = st.SetTopic(context.Background(), userID, svc, tid)
-		return tid, nil
+		return client.CreateTopic(cm, chatID, dispName)
 	}
 
 	flusher := &flusher{store: st, enqueue: func(d transport.Delivery) { queue.Enqueue(d) }, cat: c}
@@ -133,7 +132,8 @@ type flusher struct {
 }
 
 // Flush implements coalesce.Batcher: resolves the user's destination chat/thread and
-// enqueues a single (possibly batched) delivery.
+// enqueues a single (possibly batched) delivery. Render display name comes from the store
+// (V-10); severity from the first item in the batch (mirrors main.go batchFlusher).
 func (f *flusher) Flush(ctx context.Context, key coalesce.Key, items []*coalesce.Item) {
 	if len(items) == 0 {
 		return
@@ -146,11 +146,8 @@ func (f *flusher) Flush(ctx context.Context, key coalesce.Key, items []*coalesce
 		_ = f.store.QueryRow(ctx, "SELECT message_thread_id FROM group_topics WHERE user_id=? AND service=?", first.UserID, key.Service).Scan(&tid)
 		threadID = tid
 	}
-	sev := "info"
-	dispName := key.Service
-	if s, ok := f.cat.Services[key.Service]; ok && s.DisplayName != "" {
-		dispName = s.DisplayName
-	}
+	sev := first.Severity
+	dispName, _ := f.store.DisplayName(ctx, key.Service)
 	text := ingest.RenderMessage(sev, dispName, key.Type, first.Title, first.Text, first.URL)
 	if len(items) > 1 {
 		text = ingest.RenderBatch(sev, dispName, key.Type, items)
@@ -182,6 +179,14 @@ func (h *harness) seedService(t *testing.T, svc string) string {
 	t.Helper()
 	tok := "raw-token-" + svc
 	_ = h.st.CreateService(context.Background(), svc, svc, tok)
+	return tok
+}
+
+// seedServiceNamed registers a service with a custom display name and returns its token.
+func (h *harness) seedServiceNamed(t *testing.T, svc, displayName string) string {
+	t.Helper()
+	tok := "raw-token-" + svc
+	_ = h.st.CreateService(context.Background(), svc, displayName, tok)
 	return tok
 }
 

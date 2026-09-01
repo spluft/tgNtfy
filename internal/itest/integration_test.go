@@ -4,9 +4,10 @@
 //
 //	ISO-1  isolation:   user-A's event never reaches user-B's group/topic
 //	IDP-1  idempotency: duplicate event_id within 24h -> 409, one delivery only
-//	COA-1  coalesce:    a burst produces far fewer messages than per-event sends
+//	COA-1  coalesce:    production config (5s window, cap 20) collapses 60 events to <=3
 //	FOR-1  forum path:   event->forum topic delivery uses message_thread_id
-//	FOR-2  setup gates:  sender-not-admin / bot-no-manage-topics / non-forum keep 'dm'
+//	FOR-2  setup gates:  sender-not-admin / bot-no-manage-topics / non-forum keep 'dm';
+//	                       successful /connect binds group + clears stale topics, no topics created (V-9)
 //	RATE-1 per-service rate limit: 31st in a 1s burst -> 429; services independent
 //	AUTH   wrong token 401; oversize 413; malformed json 400
 //	LINK   /v1/link lifecycle: bind, single-use, unknown/used code -> 400
@@ -18,6 +19,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-telegram/bot/models"
 )
 
 const testBotToken = "123456789:TESTTOKENTESTTOKENTESTTOKEN"
@@ -97,16 +100,17 @@ func TestIDP1Idempotent409(t *testing.T) {
 	}
 }
 
-// COA-1: send 60 events for one user/service paced under the per-service 1s burst cap (<=30/s)
-// so all are accepted and land in few coalesce windows. Pipelines collapse 60 into a handful of
-// batched messages (far fewer than 60). We assert coalescing happened and batches respect cap.
+// COA-1 (rewritten, v1.1 SPEC §7/V-8): 60 same-type events for one (user,service) under
+// the PRODUCTION config (5s coalesce window, batch cap 20) produce <= 3 messages;
+// sum(batch_size) == 60; every batch <= 20. v1 acceptance measured exactly 3
+// (ceil(60/20)) — the batch cap makes the old "<=2" AC unsatisfiable (owner-approved).
 func TestCOA1CoalesceBurst(t *testing.T) {
 	mock, err := newMockBot(testBotToken)
 	if err != nil {
 		t.Fatalf("mock: %v", err)
 	}
 	t.Cleanup(mock.Close)
-	h := newHarness(t, mock, &harnessOpts{coalesceWindow: 900 * time.Millisecond, coalesceCap: 20})
+	h := newHarness(t, mock, &harnessOpts{coalesceWindow: 5 * time.Second, coalesceCap: 20})
 	tok := h.seedService(t, "goyoutube")
 	h.seedUser(t, "goyoutube", "1", 111)
 	h.setGroup(t, 111, 9001)
@@ -115,23 +119,35 @@ func TestCOA1CoalesceBurst(t *testing.T) {
 	const n = 60
 	accepted := 0
 	for i := 0; i < n; i++ {
-		rec := h.postEvent(t, tok, mkEv("goyoutube", "job_completed", "coa-"+itoa(i), "1"))
+		rec := h.postEvent(t, tok, mkEv("goyoutube", "job_completed", "coa-v11-"+itoa(i), "1"))
 		if rec.Code == http.StatusOK {
 			accepted++
 		}
-		time.Sleep(40 * time.Millisecond) // 25/s -> under 30/s burst cap
+		time.Sleep(40 * time.Millisecond) // 25/s -> under the 30/s burst cap; cap-20 flushes early
 	}
 	if accepted != n {
 		t.Fatalf("all %d must be accepted under rate limit (got %d)", n, accepted)
 	}
-	waitFor(t, 5*time.Second, func() bool { return len(mock.sendMessages()) >= 1 })
+	waitFor(t, 8*time.Second, func() bool { return len(mock.sendMessages()) >= 3 })
 	time.Sleep(300 * time.Millisecond)
-	msgs := len(mock.sendMessages())
-	if msgs >= n {
-		t.Fatalf("coalesce failed: %d messages for %d events", msgs, n)
+	msgs := mock.sendMessages()
+	if len(msgs) > 3 {
+		t.Fatalf("COA-1: production config must produce <=3 messages for 60 events, got %d", len(msgs))
 	}
-	if msgs > 12 {
-		t.Fatalf("expected strong coalescing for 60 events, got %d messages", msgs)
+	if len(msgs) < 1 {
+		t.Fatalf("COA-1: expected at least one delivery, got none")
+	}
+	var sum, maxB int
+	if err := h.st.QueryRow(context.Background(),
+		"SELECT COALESCE(SUM(batch_size),0), COALESCE(MAX(batch_size),0) FROM deliveries WHERE user_id=? AND service=?",
+		111, "goyoutube").Scan(&sum, &maxB); err != nil {
+		t.Fatalf("query deliveries: %v", err)
+	}
+	if sum != n {
+		t.Fatalf("COA-1: sum(batch_size)=%d, want %d", sum, n)
+	}
+	if maxB > 20 {
+		t.Fatalf("COA-1: a coalesce batch exceeded the cap 20: %d", maxB)
 	}
 }
 
@@ -156,7 +172,8 @@ func TestFOR1ForumDelivery(t *testing.T) {
 }
 
 // FOR-2: S2 setup gates (verifySetup via "setup:done:<uid>" callback). Each failure sends the
-// matching error and leaves the user in 'dm' with no topics created.
+// matching error and leaves the user in 'dm' with no topics created. A successful /connect
+// (V-9) binds the group, DELETES stale group_topics, and creates ZERO topics.
 func TestFOR2SetupGatesKeepDM(t *testing.T) {
 	mock, err := newMockBot(testBotToken)
 	if err != nil {
@@ -200,10 +217,31 @@ func TestFOR2SetupGatesKeepDM(t *testing.T) {
 		t.Fatalf("no topics on sender-not-admin, got %d", len(cups))
 	}
 
-	// happy: all gates pass -> S2 succeeds (issues a connect code; see FOR-1/FOR-3 flip path).
+	// V-9: happy /connect binds the group, clears any stale group_topics row for the user,
+	// and creates ZERO forum topics (topics appear lazily per linked service on link/first event).
 	mock.senderAdmin = true
 	mock.botAdmTopics = true
-	h.menuCallback(111, 9001, "setup:done:111")
+	const connectCode = "605060"
+	if err := h.st.SetTopic(context.Background(), 111, "goyoutube", 42); err != nil {
+		t.Fatalf("seed stale topic: %v", err)
+	}
+	if err := h.st.CreateConnectCode(context.Background(), connectCode, 111, time.Minute); err != nil {
+		t.Fatalf("create connect code: %v", err)
+	}
+	before := len(mock.createTopics())
+	h.menuUpdate(111, "/connect "+connectCode, models.Chat{ID: 9001, Type: models.ChatTypeSupergroup})
+	u, _ := h.st.GetUser(context.Background(), 111)
+	if u == nil || u.DeliveryMode != "group" || u.GroupChatID == nil || *u.GroupChatID != 9001 {
+		t.Fatalf("V-9: /connect must bind group mode + chat 9001, got %+v", u)
+	}
+	var staleTid int
+	if err := h.st.QueryRow(context.Background(),
+		"SELECT message_thread_id FROM group_topics WHERE user_id=? AND service=?", 111, "goyoutube").Scan(&staleTid); err == nil {
+		t.Fatalf("V-9: /connect must clear stale group_topic row, found thread %d", staleTid)
+	}
+	if got := len(mock.createTopics()); got != before {
+		t.Fatalf("V-9: /connect must create ZERO forum topics, got %d (before %d)", got, before)
+	}
 }
 
 // RATE-1: per-service rate limit keeps burst <=30/s then 429; other services stay independent.
