@@ -7,6 +7,10 @@ API endpoint uses HTTPS `:9443` with self-signed TLS.
 
 > **Before deploying** check the epic: this document is accurate for the *tgNtfy v1 gate*
 > epic branch. The live deployment gate is the epic's E2E acceptance step.
+>
+> **v1.1 note:** `config/events.yaml` is now **optional** — the gate boots and operates
+> with an empty or absent catalog. `CATALOG_PATH` is still the default path; an absent file
+> is logged at debug level, not a startup error.
 
 ---
 

@@ -21,6 +21,28 @@ frozen in `docs/epics/tgnfyt-t_352cddfe/SPEC.md` (binding).
 
 ---
 
+## v1.1 — service-agnostic lazy topic creation
+
+Where this README describes v1 behaviour, **v1.1 changes three things** (full spec:
+`docs/epics/tgnfyt-t_a86c33cd/SPEC.md`):
+
+- **The service supplies the topic name.** `POST /v1/link` now carries an **optional**
+  `display_name` field. When present and non-blank it is the single source of the topic's
+  display name (sanitised: whitespace-collapsed, control/format chars stripped, clamped to
+  128 code points; empty → service-id fallback) and it always wins, even for an already-known
+  service. `services.display_name` becomes authoritative — no new columns, no migration.
+- **Topics are created lazily, not up front.** Exactly **two** creation points: at link time
+  (only if the user is already in `delivery_mode=group`, via the idempotent
+  `store.EnsureTopic`) and as a first-event fallback. There is **no static-catalog-driven
+  creation**. `/connect` creates **zero** topics (the v1 `createTopicsFor` was removed) and
+  instead clears stale `group_topics` rows.
+- **The catalog is now optional.** `config/events.yaml` (service→event-type map + severity /
+  drop hints) is no longer required to boot: the gate starts, ingests, renders and delivers
+  with an empty or **absent** `events.yaml` (a missing file is a normal, debug-logged state).
+  `/link`, `/menu` and rendering are store-driven, not catalog-driven.
+
+---
+
 ## Architecture overview
 
 ```
@@ -146,7 +168,7 @@ The bot starts a **step-by-step script**:
 
   > Open your new group and send:
   > `/connect 123456`
-  > Your code: **123456** (10 min). I'll create one topic per linked service.
+  > Your code: **123456** (10 min). Topics appear when you link services or when the first event arrives.
 
 ### 3. Complete the binding (`/connect <code>`)
 
@@ -163,12 +185,11 @@ Open your **private group** (not the DM) and send:
 3. the bot is an **admin** with **Manage topics** allowed;
 4. you are an **admin** of that group.
 
-On success it sets your delivery mode to `group`, creates **one topic per linked service**
-via `createForumTopic`, and confirms:
+On success it sets your delivery mode to `group`, clears any stale `group_topics`
+rows, and confirms (topics are created lazily — at link time or first event, not here):
 
 > ✅ Setup complete in <group title>.
-> Topics: goYouTube · Mail · Recomendarr · VPN
-> Events will appear in their topics. Per-service mute: /menu.
+> Topics will appear as you link services and events arrive. Per-service mute: /menu.
 
 If something is wrong, the bot names the fix (grant **Manage topics**; enable Topics;
 only a group **admin** can finish) and lets you retry without burning the code.
@@ -185,7 +206,7 @@ only a group **admin** can finish) and lets you retry without burning the code.
 | `/start` | anyone | Upserts you; auto-links govpn `admin` for the first starter; welcome + commands. |
 | `/link` | anyone | Link a service to your account (service pick → 6-digit code → enter it in the service's UI). |
 | `/setup` | DM **or** group | Start/resume the step-by-step forum-group ritual (see above). |
-| `/connect <code>` | in your forum group | Bind this group (verifies forum + bot admin + group admin); sets `delivery_mode=group`; creates one topic per linked service. |
+| `/connect <code>` | in your forum group | Bind this group (verifies forum + bot admin + group admin); sets `delivery_mode=group`; clears stale `group_topics` rows. v1.1: creates zero topics (topics are created lazily at link or first-event). |
 | `/menu` | user | Two-level keyboard: service toggle (mute all) → per-event-type toggles. |
 | `/status` | user | Delivery mode + group; per-service last event; last 10 delivered; undelivered count. |
 | `/undelivered` | user | Failed deliveries (up to 20) + **🔁 Retry all failed** button. |
@@ -252,10 +273,15 @@ Response `200`: `{"status":"accepted","queued":<n deliveries created>}`.
 Called *by a service* to redeem the user's link code:
 
 ```json
-{"service": "goyoutube", "user_ref": "17", "code": "482913"}
+{"service": "goyoutube", "user_ref": "17", "code": "482913", "display_name": "goYouTube"}
 ```
 
-Requires the same `X-Service-Token` header. Response `200` `{"status":"linked","user_id":12345}`.
+`display_name` is **optional** (v1.1). When present and non-blank it becomes the topic
+display name (sanitised, 128-code-point clamp) and always wins over any previously stored
+name. Omit it for v1-compatible calls. Response `200`
+`{"status":"linked","user_id":12345,"topic_created":true}` — `topic_created` is `true` if a
+forum topic row now exists for this user+service (created just now, or pre-existing on a
+re-link); `false` in DM mode or if TG creation failed (first-event fallback retries).
 Binding + code consumption + subscription upsert happen in one transaction.
 
 ---
