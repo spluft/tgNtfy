@@ -20,6 +20,7 @@ import (
 	"github.com/spluft/tgNtfy/internal/coalesce"
 	"github.com/spluft/tgNtfy/internal/limit"
 	"github.com/spluft/tgNtfy/internal/store"
+	"github.com/spluft/tgNtfy/internal/topic"
 )
 
 // maxBodyBytes caps the envelope body (8 KB, E-4).
@@ -165,9 +166,10 @@ func (h *Handler) handleLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var lr struct {
-		Service string `json:"service"`
-		UserRef string `json:"user_ref"`
-		Code    string `json:"code"`
+		Service     string `json:"service"`
+		UserRef     string `json:"user_ref"`
+		Code        string `json:"code"`
+		DisplayName string `json:"display_name"`
 	}
 	if err := json.Unmarshal(body, &lr); err != nil {
 		writeErr(w, http.StatusBadRequest, "schema", "invalid json")
@@ -175,6 +177,10 @@ func (h *Handler) handleLink(w http.ResponseWriter, r *http.Request) {
 	}
 	if lr.Service == "" || lr.UserRef == "" || lr.Code == "" {
 		writeErr(w, http.StatusBadRequest, "schema", "service, user_ref and code required")
+		return
+	}
+	if len(lr.DisplayName) > 256 {
+		writeErr(w, http.StatusBadRequest, "schema", "display_name must be ≤256 chars")
 		return
 	}
 	if lr.Service != svc {
@@ -197,7 +203,13 @@ func (h *Handler) handleLink(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if err := h.store.LinkIdentity(ctx, lr.Service, lr.UserRef, lr.Code, userID, userID); err != nil {
+	// display_name is OPTIONAL (V-2). Sanitize to the canonical topic name; an empty
+	// result is treated as absent (the existing stored name is kept, never an error).
+	dispName := ""
+	if dn := topic.SanitizeTopicName(lr.DisplayName); dn != "" {
+		dispName = dn
+	}
+	if err := h.store.LinkIdentity(ctx, lr.Service, lr.UserRef, lr.Code, userID, userID, dispName); err != nil {
 		switch {
 		case errors.Is(err, store.ErrAlreadyLinked):
 			writeErr(w, http.StatusConflict, "already_linked", "")
@@ -214,9 +226,26 @@ func (h *Handler) handleLink(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.log.Info("identity linked", "service", lr.Service, "user_ref", lr.UserRef, "user_id", userID)
+
+	// Topic step (V-3): only when the user is ALREADY in group mode with a group chat.
+	// topic_created=true iff a group_topics row exists for (user,service) afterwards
+	// (created now OR pre-existing). In dm mode no topic is created yet — deferred to
+	// first-event delivery (D-FALL). A link that creates no topic is CORRECT.
+	topicCreated := false
+	if u, gu := h.store.GetUser(ctx, userID); gu == nil && u != nil && u.DeliveryMode == "group" && u.GroupChatID != nil {
+		if _, _, terr := h.store.EnsureTopic(ctx, userID, *u.GroupChatID, lr.Service,
+			func(chatID int64, svc string) (int, error) { return h.topicResolver(ctx, userID, chatID, svc) }); terr != nil {
+			h.log.Warn("lazy topic at link failed; first-event fallback will retry",
+				"service", lr.Service, "user_id", userID, "err", terr)
+		} else {
+			// topic_created=true iff a group_topics row exists afterwards (created NOW or
+			// pre-existing on an idempotent re-link, V-4) — §3.3.
+			topicCreated = true
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]any{"status": "linked", "user_id": userID})
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "linked", "user_id": userID, "topic_created": topicCreated})
 }
 
 // userIDForLinkCode resolves the TG user who owns a link code.

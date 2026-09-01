@@ -154,14 +154,32 @@ func (h *Handler) cmdSetup(ctx context.Context, m *models.Message) {
 		}}})
 }
 
-// cmdLink implements /link (UC-2): pick a service from keyboard, then issue a code.
-func (h *Handler) cmdLink(ctx context.Context, m *models.Message) {
-	cat := h.gate.Cat.Get()
+// serviceKeyboard builds the link keyboard from ENABLED services in the store (V-10,
+// D-MENU-1): a service registers purely via /setup + POST /v1/link — no catalog.
+func (h *Handler) serviceKeyboard(ctx context.Context) [][]models.InlineKeyboardButton {
+	svcs, err := h.gate.Store.ServiceList(ctx)
+	if err != nil {
+		h.gate.Log.Error("service list", "err", err)
+		return nil
+	}
 	var kb [][]models.InlineKeyboardButton
-	for svc, s := range cat.Services {
+	for _, s := range svcs {
+		if s.Enabled != 1 {
+			continue
+		}
 		kb = append(kb, []models.InlineKeyboardButton{{
-			Text: s.DisplayName, CallbackData: "link:svc:" + svc,
+			Text: s.DisplayName, CallbackData: "link:svc:" + s.Service,
 		}})
+	}
+	return kb
+}
+
+// cmdLink implements /link (UC-2): pick a linked/available service, then issue a code.
+func (h *Handler) cmdLink(ctx context.Context, m *models.Message) {
+	kb := h.serviceKeyboard(ctx)
+	if len(kb) == 0 {
+		_ = h.send(ctx, m.Chat.ID, "No services available yet. Ask the operator to enable a service, then try again.")
+		return
 	}
 	h.api.SendKeyboard(ctx, m.Chat.ID, 0, "Link a service — pick one:", kb)
 }
@@ -205,6 +223,14 @@ func (h *Handler) handleCallback(ctx context.Context, b *bot.Bot, cq *models.Cal
 		h.issueLinkCode(ctx, uid, chatID, svc)
 	case strings.HasPrefix(data, "menu:"):
 		h.handleMenuCallback(ctx, uid, chatID, cq)
+	case data == "link:list":
+		h.api.AnswerCallback(ctx, cq.ID, false, "")
+		kb := h.serviceKeyboard(ctx)
+		if len(kb) == 0 {
+			_ = h.send(ctx, chatID, "No services available yet.")
+			return
+		}
+		h.api.SendKeyboard(ctx, chatID, 0, "Link a service — pick one:", kb)
 	case data == "retry_failed":
 		h.api.AnswerCallback(ctx, cq.ID, false, "")
 		n, err := h.gate.Store.RetryAllFailed(ctx, 50)
@@ -254,7 +280,7 @@ func (h *Handler) verifySetup(ctx context.Context, uid, chatID int64) {
 		_ = h.send(ctx, chatID, "Internal error — try again.")
 		return
 	}
-	text := fmt.Sprintf("📋 STEP 2/2 — Open your new group and send:\n/connect %s\nYour code: **%s** (10 min). I'll create one topic per linked service.", code, code)
+	text := fmt.Sprintf("📋 STEP 2/2 — Open your new group and send:\n/connect %s\nYour code: **%s** (10 min). Your linked services will get a topic each.", code, code)
 	_ = h.send(ctx, chatID, text)
 }
 
@@ -273,14 +299,18 @@ func (h *Handler) finishSetup(ctx context.Context, uid, chatID int64, code strin
 		_ = h.send(ctx, chatID, "Setup failed to save.")
 		return
 	}
-	h.createTopicsFor(ctx, uid, chatID)
+	// V-9: a new group means old message_thread_ids point at the previous chat — drop the
+	// user's stale group_topics; topics reappear lazily per linked service (link/first event).
+	if err := h.gate.Store.ClearUserTopics(ctx, uid); err != nil {
+		h.gate.Log.Warn("clear stale topics", "err", err)
+	}
 	ci, _ := h.api.GetChat(ctx, chatID)
 	title := ""
 	if ci != nil {
 		title = ci.Title
 	}
 	tp := h.linkedServiceNames(ctx, uid)
-	_ = h.send(ctx, chatID, "✅ Setup complete"+(ifStr(title != "", " in "+title, ""))+"."+ifStr(len(tp) > 0, "\nTopics: "+strings.Join(tp, " · "), "")+"\nEvents appear in their topics. Per-service mute: /menu.")
+	_ = h.send(ctx, chatID, "✅ Setup complete"+(ifStr(title != "", " in "+title, ""))+"."+ifStr(len(tp) > 0, "\nLinked: "+strings.Join(tp, " · "), "")+"\nEvents appear in their topics. Per-service mute: /menu.")
 }
 
 // forumChatOf returns a forum chat where uid has been active.
@@ -293,28 +323,11 @@ func (h *Handler) forumChatOf(uid int64) int64 {
 	return 0
 }
 
-func (h *Handler) createTopicsFor(ctx context.Context, uid, chatID int64) {
-	cat := h.gate.Cat.Get()
-	for svc, s := range cat.Services {
-		tabular, err := h.api.CreateTopic(ctx, chatID, s.DisplayName)
-		if err != nil {
-			h.gate.Log.Warn("create topic", "service", svc, "err", err)
-			continue
-		}
-		_ = h.gate.Store.SetTopic(ctx, uid, svc, tabular)
-	}
-}
-
 func (h *Handler) linkedServiceNames(ctx context.Context, uid int64) []string {
-	cat := h.gate.Cat.Get()
 	var out []string
-	users := h.gate.Store.LinkedServices(ctx, uid)
-	for _, svc := range users {
-		if s, ok := cat.Services[svc]; ok {
-			out = append(out, s.DisplayName)
-		} else {
-			out = append(out, svc)
-		}
+	for _, svc := range h.gate.Store.LinkedServices(ctx, uid) {
+		dn, _ := h.gate.Store.DisplayName(ctx, svc)
+		out = append(out, dn)
 	}
 	return out
 }
@@ -325,16 +338,10 @@ func (h *Handler) cmdMenu(ctx context.Context, m *models.Message) {
 }
 
 func (h *Handler) menuLevel1(ctx context.Context, uid, chatID int64) {
-	cat := h.gate.Cat.Get()
 	var rows [][]models.InlineKeyboardButton
-	linked := map[string]bool{}
 	for _, svc := range h.gate.Store.LinkedServices(ctx, uid) {
-		// subscription muted?
 		mut, _ := h.gate.Store.SubscriptionMuted(ctx, uid, svc)
-		disp := svc
-		if s, ok := cat.Services[svc]; ok {
-			disp = s.DisplayName
-		}
+		disp, _ := h.gate.Store.DisplayName(ctx, svc)
 		icon := "✅ "
 		if mut {
 			icon = "🔕 "
@@ -342,16 +349,11 @@ func (h *Handler) menuLevel1(ctx context.Context, uid, chatID int64) {
 		rows = append(rows, []models.InlineKeyboardButton{{
 			Text: icon + disp, CallbackData: "menu:svc:" + svc,
 		}})
-		linked[svc] = true
 	}
-	// Unlinked catalog services show a link CTA.
-	for svc, s := range cat.Services {
-		if !linked[svc] {
-			rows = append(rows, []models.InlineKeyboardButton{{
-				Text: "➕ link " + s.DisplayName + "…", CallbackData: "link:svc:" + svc,
-			}})
-		}
-	}
+	// Brand-new service: link it via the store-backed keyboard (no catalog).
+	rows = append(rows, []models.InlineKeyboardButton{{
+		Text: "➕ link another service…", CallbackData: "link:list",
+	}})
 	h.api.SendKeyboard(ctx, chatID, 0, "📡 Your services — tap to manage:", rows)
 }
 
@@ -396,17 +398,16 @@ func (h *Handler) menuLevel2(ctx context.Context, uid, chatID int64, svc string)
 	cat := h.gate.Cat.Get()
 	mut, _ := h.gate.Store.SubscriptionMuted(ctx, uid, svc)
 	enabled, _ := h.gate.Store.EventTypesEnabled(ctx, uid, svc)
+	types := cat.ServiceTypes(svc)
 	var rows [][]models.InlineKeyboardButton
-	if s, ok := cat.Services[svc]; ok {
-		for typ := range s.Events {
-			icon := "⬜ "
-			if contains(enabled, typ) {
-				icon = "✅ "
-			}
-			rows = append(rows, []models.InlineKeyboardButton{{
-				Text: icon + typ, CallbackData: "menu:type:" + svc + ":" + typ,
-			}})
+	for _, typ := range types {
+		icon := "⬜ "
+		if contains(enabled, typ) {
+			icon = "✅ "
 		}
+		rows = append(rows, []models.InlineKeyboardButton{{
+			Text: icon + typ, CallbackData: "menu:type:" + svc + ":" + typ,
+		}})
 	}
 	muteTxt := "🔕 Mute all"
 	if mut {
@@ -416,20 +417,17 @@ func (h *Handler) menuLevel2(ctx context.Context, uid, chatID int64, svc string)
 		[]models.InlineKeyboardButton{{Text: muteTxt, CallbackData: "menu:mute:" + svc}},
 		[]models.InlineKeyboardButton{{Text: "⬅️ Back", CallbackData: "menu:back:"}},
 	)
-	disp := svc
-	if s, ok := cat.Services[svc]; ok {
-		disp = s.DisplayName
+	disp, _ := h.gate.Store.DisplayName(ctx, svc)
+	head := disp + " — choose event types:"
+	if len(types) == 0 {
+		head = disp + " — (event types unknown to the gate — all types on)"
 	}
-	h.api.SendKeyboard(ctx, chatID, 0, disp+" — choose event types:", rows)
+	h.api.SendKeyboard(ctx, chatID, 0, head, rows)
 }
 
 // issueLinkCode issues a 6-digit link code for a service (UC-2 step 2).
 func (h *Handler) issueLinkCode(ctx context.Context, uid, chatID int64, svc string) {
-	cat := h.gate.Cat.Get()
-	disp := svc
-	if s, ok := cat.Services[svc]; ok {
-		disp = s.DisplayName
-	}
+	disp, _ := h.gate.Store.DisplayName(ctx, svc)
 	code := h.newCode()
 	if err := h.gate.Store.CreateLinkCode(ctx, code, svc, uid, 10*time.Minute, nil); err != nil {
 		_ = h.send(ctx, chatID, "Failed to create a code — try again.")
@@ -543,7 +541,7 @@ func ifStr(cond bool, a, b string) string {
 }
 
 const (
-	welcomeText            = "Hi! I'm the tgNtfy gate. Your events from goYouTube, Mail, Recomendarr and VPN will arrive in YOUR personal Telegram forum group — one topic per service.\n1) Link a service: /link\n2) Create your group: /setup\nManage anything in /menu."
+	welcomeText            = "Hi! I'm the tgNtfy gate. Your service events arrive in YOUR personal Telegram forum group — one topic per linked service.\n1) Link a service: /link\n2) Create your group: /setup\nManage anything in /menu."
 	helpText               = "Commands:\n/link — link a service\n/setup — create your forum group\n/connect <code> — bind this group (send in your group)\n/menu — manage services & types\n/status — delivery status\n/undelivered — failed deliveries"
 	setupStep1Text         = "📋 STEP 1/2 — Create a new **private** group in Telegram (any name, e.g. 'my tgntfy'). Members: only you. Then add **me** as **Administrator** with the permission **Manage topics** (group → Administrators → Edit → Manage topics ✓).\n\nWhen done, tap ✅ I did it."
 	setupErrNoGroup        = "I can't find your group yet. Open your private group and send any message there (e.g. /setup), then tap ✅ I did it again."
