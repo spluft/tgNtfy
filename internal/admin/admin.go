@@ -61,7 +61,7 @@ func Run(args []string, stdout, stderr io.Writer) {
 		}
 		fmt.Fprintf(stdout, "unlinked %s user_ref=%s\n", args[2], args[3])
 	case "user":
-		listUsers(ctx, args[2:], st, stdout, stderr)
+		listUsers(ctx, st, stdout, stderr)
 	case "events":
 		eventsRecent(ctx, args[2:], st, stdout, stderr)
 	default:
@@ -154,8 +154,7 @@ func svcArgs(args []string, st *store.Store, stdout, stderr io.Writer) {
 	}
 }
 
-func listUsers(ctx context.Context, args []string, st *store.Store, stdout, stderr io.Writer) {
-	_ = args
+func listUsers(ctx context.Context, st *store.Store, stdout, stderr io.Writer) {
 	list, err := st.UserList(ctx)
 	if err != nil {
 		fmt.Fprintf(stderr, "users: %v\n", err)

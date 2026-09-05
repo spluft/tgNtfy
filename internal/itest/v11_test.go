@@ -53,9 +53,8 @@ func TestFOR3LinkCreatesTopicAtRegistration(t *testing.T) {
 		t.Fatalf("forum topic name = %q, want %q (sanitized)", name, "Go YouTube x!")
 	}
 
-	var tid int
-	if err := h.st.QueryRow(context.Background(),
-		"SELECT message_thread_id FROM group_topics WHERE user_id=? AND service=?", 111, "goyoutube").Scan(&tid); err != nil {
+	tid, _, err := h.st.GetTopicThread(context.Background(), 111, "goyoutube")
+	if err != nil {
 		t.Fatalf("group_topics row missing after link: %v", err)
 	}
 	if tid == 0 {
@@ -129,9 +128,8 @@ func TestFOR4DMDeferralThenFirstEventFallback(t *testing.T) {
 	if name := stringify(tps[0].Form["name"]); name != "MyService Label" {
 		t.Fatalf("fallback topic name = %q, want %q (store display name, NOT catalog)", name, "MyService Label")
 	}
-	var tid int
-	if err := h.st.QueryRow(context.Background(),
-		"SELECT message_thread_id FROM group_topics WHERE user_id=? AND service=?", 111, "goyoutube").Scan(&tid); err != nil {
+	tid, _, err := h.st.GetTopicThread(context.Background(), 111, "goyoutube")
+	if err != nil {
 		t.Fatalf("fallback topic not persisted: %v", err)
 	}
 	sends := mock.sendMessages()
@@ -171,9 +169,8 @@ func TestIDL1RelinkIdempotentNoDuplicate(t *testing.T) {
 	if got := len(mock.createTopics()); got != 1 {
 		t.Fatalf("link1 must create exactly one topic, got %d", got)
 	}
-	var tid1 int
-	if err := h.st.QueryRow(context.Background(),
-		"SELECT message_thread_id FROM group_topics WHERE user_id=? AND service=?", 111, "goyoutube").Scan(&tid1); err != nil {
+	tid1, _, err := h.st.GetTopicThread(context.Background(), 111, "goyoutube")
+	if err != nil {
 		t.Fatalf("topic1 row: %v", err)
 	}
 
@@ -188,9 +185,7 @@ func TestIDL1RelinkIdempotentNoDuplicate(t *testing.T) {
 	if got := len(mock.createTopics()); got != 1 {
 		t.Fatalf("re-link must NOT create a duplicate topic, createForumTopic now=%d want 1", got)
 	}
-	var tid2 int
-	if err := h.st.QueryRow(context.Background(),
-		"SELECT message_thread_id FROM group_topics WHERE user_id=? AND service=?", 111, "goyoutube").Scan(&tid2); err != nil || tid2 != tid1 {
+	if tid2, _, err := h.st.GetTopicThread(context.Background(), 111, "goyoutube"); err != nil || tid2 != tid1 {
 		t.Fatalf("re-link must reuse the row: tid1=%d tid2=%d err=%v", tid1, tid2, err)
 	}
 	if dn, _ := h.st.DisplayName(context.Background(), "goyoutube"); dn != "goYouTube Renamed" {

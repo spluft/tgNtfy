@@ -109,9 +109,6 @@ func WithTopicResolver(r func(ctx context.Context, userID, chatID int64, service
 // WithCoalescer wires a shared coalescer.
 func WithCoalescer(c *coalesce.Coalescer) Opt { return func(h *Handler) { h.coalesc = c } }
 
-// SetCoalescer attaches the coalescer (called after construction).
-func (h *Handler) SetCoalescer(c *coalesce.Coalescer) { h.coalesc = c }
-
 // Routes returns the mux with ingest endpoints mounted.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
@@ -119,7 +116,6 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/v1/link", h.handleLink)
 	return mux
 }
-
 func writeErr(w http.ResponseWriter, status int, code, detail string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -194,7 +190,7 @@ func (h *Handler) handleLink(w http.ResponseWriter, r *http.Request) {
 	}
 	// The code row records which TG user the code was issued to. POST /v1/link is
 	// called BY the service, so the identity (tg user) is resolved from the code.
-	userID, err := h.userIDForLinkCode(ctx, lr.Code)
+	userID, err := h.store.UserIDForLinkCode(ctx, lr.Code)
 	if err != nil {
 		if errors.Is(err, store.ErrCodeInvalid) {
 			writeErr(w, http.StatusBadRequest, "code_invalid", "code not found or expired")
@@ -246,11 +242,6 @@ func (h *Handler) handleLink(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "linked", "user_id": userID, "topic_created": topicCreated})
-}
-
-// userIDForLinkCode resolves the TG user who owns a link code.
-func (h *Handler) userIDForLinkCode(ctx context.Context, code string) (int64, error) {
-	return h.store.UserIDForLinkCode(ctx, code)
 }
 
 func (h *Handler) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -370,8 +361,6 @@ func validateEnvelope(ev *Envelope) error {
 		return errors.New("event_id must be 1..255 chars")
 	case ev.Service == "" || len(ev.Service) > 32:
 		return errors.New("service must be 1..32 chars")
-	case ev.Service == "":
-		return errors.New("service required")
 	case ev.UserRef == "":
 		return errors.New("user_ref required")
 	case ev.Type == "" || len(ev.Type) > 64:

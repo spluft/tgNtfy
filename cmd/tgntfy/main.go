@@ -20,12 +20,12 @@ import (
 	"github.com/spluft/tgNtfy/internal/admin"
 	"github.com/spluft/tgNtfy/internal/catalog"
 	"github.com/spluft/tgNtfy/internal/coalesce"
+	"github.com/spluft/tgNtfy/internal/dispatch"
 	"github.com/spluft/tgNtfy/internal/healthz"
 	"github.com/spluft/tgNtfy/internal/ingest"
 	"github.com/spluft/tgNtfy/internal/menu"
 	"github.com/spluft/tgNtfy/internal/store"
 	"github.com/spluft/tgNtfy/internal/tgbot"
-	"github.com/spluft/tgNtfy/internal/topic"
 	"github.com/spluft/tgNtfy/internal/transport"
 )
 
@@ -117,13 +117,7 @@ func runServer() error {
 	// Topic resolver: lazy createForumTopic only on a group_topics miss (the store's
 	// EnsureTopic does the row-first lookup + idempotent row upsert). Name source is the
 	// store's services.display_name (V-1/V-5), never the catalog; fallback: service id.
-	topicResolver := func(cm context.Context, userID, chatID int64, svc string) (int, error) {
-		disp, _ := st.DisplayName(cm, svc)
-		if name := topic.SanitizeTopicName(disp); name != "" {
-			disp = name
-		}
-		return client.CreateTopic(cm, chatID, disp)
-	}
+	topicResolver := dispatch.TopicResolverFor(st, client)
 
 	// Dispatcher.
 	queue := transport.NewQueue(5000)
@@ -132,11 +126,9 @@ func runServer() error {
 	defer dispatcher.Stop()
 
 	// Coalescer: flush -> resolve dest + create delivery row + enqueue.
-	flusher := &batchFlusher{
-		enqueue: func(cm context.Context, d transport.Delivery) { dispatcher.Enqueue(d) },
-		store:   st,
-		log:     log,
-	}
+	flusher := dispatch.NewBatchFlusher(st, func(cm context.Context, d transport.Delivery) {
+		dispatcher.Enqueue(d)
+	}, log)
 	coalescer := coalesce.New(time.Duration(coalesceMs)*time.Millisecond, 20, flusher)
 
 	// Ingest.
@@ -185,47 +177,4 @@ func runServer() error {
 	case err := <-errc:
 		return err
 	}
-}
-
-// batchFlusher renders a coalesced batch and enqueues it as one delivery row.
-type batchFlusher struct {
-	enqueue func(ctx context.Context, d transport.Delivery)
-	store   *store.Store
-	log     *slog.Logger
-}
-
-func (b *batchFlusher) Flush(ctx context.Context, key coalesce.Key, items []*coalesce.Item) {
-	if len(items) == 0 {
-		return
-	}
-	ev := items[0]
-	// Resolve the destination chat + thread for this user.
-	chatID, threadID := ev.UserID, 0
-	if u, err := b.store.GetUser(ctx, ev.UserID); err == nil && u != nil && u.DeliveryMode == "group" && u.GroupChatID != nil {
-		chatID = *u.GroupChatID
-		var tid int
-		er := b.store.QueryRow(ctx, "SELECT message_thread_id FROM group_topics WHERE user_id=? AND service=?", ev.UserID, key.Service).Scan(&tid)
-		if er == nil {
-			threadID = tid
-		}
-	}
-	disp, _ := b.store.DisplayName(ctx, key.Service)
-	text := ingest.RenderMessage(ev.Severity, disp, key.Type, ev.Title, ev.Text, ev.URL)
-	if len(items) > 1 {
-		text = ingest.RenderBatch(ev.Severity, disp, key.Type, items)
-	}
-	rowID, err := b.store.CreateDelivery(ctx, ev.UserID, chatID, threadID, ev.EventID, key.Service, key.Type, len(items))
-	if err != nil {
-		b.log.Error("create delivery row", "err", err)
-		return
-	}
-	b.enqueue(ctx, transport.Delivery{
-		RowID:           rowID,
-		UserID:          ev.UserID,
-		ChatID:          chatID,
-		MessageThreadID: threadID,
-		Text:            text,
-		Service:         key.Service,
-	})
-	ingest.RecordBatch(len(items))
 }

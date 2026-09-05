@@ -82,13 +82,13 @@ func (c *Coalescer) Add(ctx context.Context, key Key, item *Item) {
 	c.mu.Unlock()
 
 	if hitCap {
-		c.ForceFlush(key, p)
+		c.forceFlush(key, p)
 	}
 }
 
-// ForceFlush immediately flushes any pending batch for key (used for deterministic tests and
-// the batch-cap early flush).
-func (c *Coalescer) ForceFlush(key Key, p *pending) {
+// forceFlush immediately flushes the pending batch for key when p is still the
+// batch registered for it (batch-cap early flush).
+func (c *Coalescer) forceFlush(key Key, p *pending) {
 	c.mu.Lock()
 	if c.b[key] != p {
 		c.mu.Unlock()
@@ -106,6 +106,3 @@ func (c *Coalescer) flushBatch(ctx context.Context, p *pending) {
 	}
 	c.flush.Flush(ctx, p.key, p.items)
 }
-
-// Window returns the configured window duration.
-func (c *Coalescer) Window() time.Duration { return c.window }
