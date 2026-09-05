@@ -1,6 +1,10 @@
 # tgNtfy v1.1 — Binding Implementation SPEC
 ## Service-agnostic lazy topic creation + optional catalog + 2 acceptance-FAIL fixes
 
+> **Doc status (labeled 2026-09-05, epic t_2d992300 docs reorg): BINDING (current).**
+> Last verified 2026-09-02; shipped to main (tip `48d6964`). Amends the v1 spec
+> (`docs/epics/tgnfyt-t_352cddfe/SPEC.md`) where stated. See `docs/README.md` for the index.
+
 **Epic:** t_a86c33cd — tgNtfy v1.1: service-agnostic topic creation (service supplies name; topic created at registration)
 **Builds on:** v1 feature branch `feature/tgnfyt-t_352cddfe-gate-v1` (tip `056b774`) — this spec amends v1 SPEC `docs/epics/tgnfyt-t_352cddfe/SPEC.md` where stated; all v1 bindings not amended here remain in force.
 **Project:** tgNtfy (`github.com/spluft/tgNtfy`) · board `spluft` · default branch `main`

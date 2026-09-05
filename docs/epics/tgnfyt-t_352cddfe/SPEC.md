@@ -1,5 +1,10 @@
 # tgNtfy v1 — Binding Implementation SPEC
 
+> **Doc status (labeled 2026-09-05, epic t_2d992300 docs reorg): SUPERSEDED IN PART.**
+> Last verified 2026-09-01 against the v1 feature branch. Its bindings remain in force
+> **except where amended by `docs/epics/tgnfyt-t_a86c33cd/SPEC.md`** (v1.1: lazy topic
+> creation, optional catalog, coalesce AC ≤3). See `docs/README.md` for the index.
+
 **Epic:** t_352cddfe — tgNtfy v1 Go gate with TG forum-group delivery
 **Authoritative input:** `docs/epics/tgnfyt-t_54a6debb/RESEARCH.md` (research epic t_54a6debb, on main)
 **Project:** tgNtfy (`github.com/spluft/tgNtfy`) · board `spluft` · default branch `main`

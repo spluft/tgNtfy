@@ -1,5 +1,10 @@
 # Epic t_54a6debb — tgNtfy: research (язык, единый API-контракт, топология доставки)
 
+> **Doc status (labeled 2026-09-05, epic t_2d992300 docs reorg): SUPERSEDED (historical).**
+> Last verified 2026-09-01. Pre-design research in Russian; its open decision §7
+> (delivery topology) was resolved in favor of per-user forum groups with one topic per
+> service and is implemented. Kept for provenance; see `docs/README.md` for the index.
+
 **Проект:** tgNtfy (`github.com/spluft/tgNtfy`)
 **Board:** spluft · **Default branch:** main
 **Тип:** RESEARCH / DESIGN — код НЕ пишется, деплой НЕ требуется
