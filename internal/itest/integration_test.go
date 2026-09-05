@@ -137,10 +137,8 @@ func TestCOA1CoalesceBurst(t *testing.T) {
 	if len(msgs) < 1 {
 		t.Fatalf("COA-1: expected at least one delivery, got none")
 	}
-	var sum, maxB int
-	if err := h.st.QueryRow(context.Background(),
-		"SELECT COALESCE(SUM(batch_size),0), COALESCE(MAX(batch_size),0) FROM deliveries WHERE user_id=? AND service=?",
-		111, "goyoutube").Scan(&sum, &maxB); err != nil {
+	sum, maxB, err := h.st.DeliveryBatchStats(context.Background(), 111, "goyoutube")
+	if err != nil {
 		t.Fatalf("query deliveries: %v", err)
 	}
 	if sum != n {
@@ -234,9 +232,7 @@ func TestFOR2SetupGatesKeepDM(t *testing.T) {
 	if u == nil || u.DeliveryMode != "group" || u.GroupChatID == nil || *u.GroupChatID != 9001 {
 		t.Fatalf("V-9: /connect must bind group mode + chat 9001, got %+v", u)
 	}
-	var staleTid int
-	if err := h.st.QueryRow(context.Background(),
-		"SELECT message_thread_id FROM group_topics WHERE user_id=? AND service=?", 111, "goyoutube").Scan(&staleTid); err == nil {
+	if staleTid, found, _ := h.st.GetTopicThread(context.Background(), 111, "goyoutube"); found {
 		t.Fatalf("V-9: /connect must clear stale group_topic row, found thread %d", staleTid)
 	}
 	if got := len(mock.createTopics()); got != before {

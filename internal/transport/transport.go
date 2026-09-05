@@ -33,12 +33,14 @@ type Dispatcher interface {
 	SendNow(ctx context.Context, d Delivery) error
 }
 
-// StoreIface is the delivery-row bookkeeping the dispatcher needs.
+// StoreIface is the delivery-row bookkeeping the dispatcher needs. The method
+// set is the store's real API (SPEC R6: the thin DeliveryAttemptFailed /
+// DeliveryExhausted wrappers were removed rather than kept as a third layer).
 type StoreIface interface {
 	MarkDeliverySent(ctx context.Context, id, tgMsgID int64) error
-	DeliveryAttemptFailed(ctx context.Context, id int64, attempts int, nextRetry *time.Time, errMsg string) error
+	MarkDeliveryFailed(ctx context.Context, id int64, attempts int, nextRetry *time.Time, errMsg string) error
 	DeliveryRetry429(ctx context.Context, id int64) error
-	DeliveryExhausted(ctx context.Context, id int64, attempts int, errMsg string) error
+	FailDeliveryPermanently(ctx context.Context, id int64, attempts int, errMsg string) error
 }
 
 var (
@@ -73,19 +75,19 @@ func backoff(n int) time.Duration {
 	return d
 }
 
-// TokenBucket paces egress to the per-chat ~30 msg/min and global 15/s caps.
+// TokenBucket paces egress with a single shared bucket (cap 30, refill 0.5/s).
 type TokenBucket struct {
-	capacity  float64
-	refill43s float64 // tokens per second
-	current   float64
-	last      time.Time
-	now       func() time.Time
+	capacity     float64
+	refillPerSec float64 // tokens per second
+	current      float64
+	last         time.Time
+	now          func() time.Time
 }
 
 // NewTokenBucket builds a bucket with `capacity` tokens refilling at `perSec`/s.
 func NewTokenBucket(capacity, perSec float64) *TokenBucket {
 	return &TokenBucket{
-		capacity: capacity, refill43s: perSec, current: capacity,
+		capacity: capacity, refillPerSec: perSec, current: capacity,
 		last: time.Now(), now: time.Now,
 	}
 }
@@ -95,7 +97,7 @@ func (t *TokenBucket) take() {
 	for {
 		now := t.now()
 		dt := now.Sub(t.last).Seconds()
-		t.current += dt * t.refill43s
+		t.current += dt * t.refillPerSec
 		if t.current > t.capacity {
 			t.current = t.capacity
 		}
@@ -104,7 +106,7 @@ func (t *TokenBucket) take() {
 			t.current--
 			return
 		}
-		need := time.Duration((1 - t.current) / t.refill43s * float64(time.Second))
+		need := time.Duration((1 - t.current) / t.refillPerSec * float64(time.Second))
 		time.Sleep(need)
 	}
 }
@@ -125,18 +127,6 @@ func (q *Queue) Enqueue(d Delivery) {
 	default:
 	}
 }
-
-// TryRecv attempts a non-blocking receive.
-func (q *Queue) TryRecv() (Delivery, bool) {
-	select {
-	case d := <-q.ch:
-		queueDepth.Set(float64(len(q.ch)))
-		return d, true
-	default:
-		return Delivery{}, false
-	}
-}
-
 func (q *Queue) recvBlocking(stop <-chan struct{}) (Delivery, bool) {
 	select {
 	case d := <-q.ch:
@@ -153,9 +143,11 @@ type TelegramTransport struct {
 	store    StoreIface
 	log      *slog.Logger
 	queue    *Queue
-	chatPace *TokenBucket // 30 msg/min per chat => shared global approximation
-	stop     chan struct{}
-	sleep    func(d time.Duration)
+	chatPace *TokenBucket // ONE shared bucket (cap 30, 0.5/s) — a global
+	// approximation of the per-chat ~30 msg/min cap, NOT a per-chat bucket (D-4
+	// adjacent: 429 loop is uncapped; behavior preserved as-is).
+	stop  chan struct{}
+	sleep func(d time.Duration)
 }
 
 // NewTelegramTransport wires a sender, store, and bounded queue with egress pacing.
@@ -216,16 +208,16 @@ func (t *TelegramTransport) deliverWithRetry(ctx context.Context, d Delivery) er
 		}
 		if errors.Is(err, bot.ErrorForbidden) {
 			// E-9: fail fast after attempt 1.
-			_ = t.store.DeliveryExhausted(ctx, d.RowID, attempt+1, err.Error())
+			_ = t.store.FailDeliveryPermanently(ctx, d.RowID, attempt+1, err.Error())
 			deliveriesFail.WithLabelValues(d.Service).Inc()
 			return err
 		}
 		// transport/5xx/400-class: consume an attempt, backoff.
 		nr := time.Now().Add(backoff(attempt))
-		_ = t.store.DeliveryAttemptFailed(ctx, d.RowID, attempt+1, &nr, err.Error())
+		_ = t.store.MarkDeliveryFailed(ctx, d.RowID, attempt+1, &nr, err.Error())
 		t.sleep(backoff(attempt))
 	}
-	_ = t.store.DeliveryExhausted(ctx, d.RowID, maxAttempts, "retries exhausted")
+	_ = t.store.FailDeliveryPermanently(ctx, d.RowID, maxAttempts, "retries exhausted")
 	deliveriesFail.WithLabelValues(d.Service).Inc()
 	return errors.New("retries exhausted")
 }

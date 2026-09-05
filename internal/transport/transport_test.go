@@ -22,12 +22,12 @@ func (f *fakeStore) MarkDeliverySent(ctx context.Context, id, tgMsgID int64) err
 	f.sent++
 	return nil
 }
-func (f *fakeStore) DeliveryAttemptFailed(ctx context.Context, id int64, a int, next *time.Time, e string) error {
+func (f *fakeStore) MarkDeliveryFailed(ctx context.Context, id int64, a int, next *time.Time, e string) error {
 	f.failed++
 	return nil
 }
 func (f *fakeStore) DeliveryRetry429(ctx context.Context, id int64) error { f.ret429++; return nil }
-func (f *fakeStore) DeliveryExhausted(ctx context.Context, id int64, a int, e string) error {
+func (f *fakeStore) FailDeliveryPermanently(ctx context.Context, id int64, a int, e string) error {
 	f.exhausted++
 	return nil
 }

@@ -54,11 +54,6 @@ type Lookup struct {
 // NewLookup returns a Lookup seeded with cat.
 func NewLookup(cat *Catalog) *Lookup { return &Lookup{cat: cat} }
 
-// Empty returns a Lookup with a valid but empty catalog (used when no catalog file).
-func Empty() *Lookup {
-	return &Lookup{cat: &Catalog{Version: 1, Services: map[string]Service{}}}
-}
-
 // Get returns the current catalog snapshot.
 func (l *Lookup) Get() *Catalog {
 	l.mu.RLock()

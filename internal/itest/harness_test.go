@@ -17,12 +17,12 @@ import (
 	"github.com/go-telegram/bot/models"
 	"github.com/spluft/tgNtfy/internal/catalog"
 	"github.com/spluft/tgNtfy/internal/coalesce"
+	"github.com/spluft/tgNtfy/internal/dispatch"
 	"github.com/spluft/tgNtfy/internal/healthz"
 	"github.com/spluft/tgNtfy/internal/ingest"
 	"github.com/spluft/tgNtfy/internal/menu"
 	"github.com/spluft/tgNtfy/internal/store"
 	"github.com/spluft/tgNtfy/internal/tgbot"
-	"github.com/spluft/tgNtfy/internal/topic"
 	"github.com/spluft/tgNtfy/internal/transport"
 )
 
@@ -91,19 +91,15 @@ func newHarness(t *testing.T, mock *mockBot, o *harnessOpts) *harness {
 	go disp.Run()
 	t.Cleanup(disp.Stop)
 
-	// topicResolver mirrors main.go (V-1/V-5): the forum topic name comes from the
-	// STORE's services.display_name (sanitized; fallback: the service id), NEVER the
-	// catalog. store.EnsureTopic performs the row-first lookup + idempotent row upsert,
-	// so this callback only creates the topic on a group_topics miss.
-	resolver := func(cm context.Context, userID, chatID int64, svc string) (int, error) {
-		dispName, _ := st.DisplayName(cm, svc)
-		if name := topic.SanitizeTopicName(dispName); name != "" {
-			dispName = name
-		}
-		return client.CreateTopic(cm, chatID, dispName)
-	}
+	// topicResolver + flusher are the PRODUCTION wiring (internal/dispatch, extracted
+	// from main.go by epic t_2d992300 R1) so the harness exercises real flush/resolver
+	// logic instead of a near-identical copy. store.EnsureTopic still performs the
+	// row-first lookup + idempotent row upsert (V-1/V-5: name from services.display_name).
+	resolver := dispatch.TopicResolverFor(st, client)
 
-	flusher := &flusher{store: st, enqueue: func(d transport.Delivery) { queue.Enqueue(d) }, cat: c}
+	flusher := dispatch.NewBatchFlusher(st, func(cm context.Context, d transport.Delivery) {
+		queue.Enqueue(d)
+	}, discardLog)
 	co := coalesce.New(o.coalesceWindow, o.coalesceCap, flusher)
 
 	ing := ingest.NewHandler(st, catLk, nil,
@@ -122,44 +118,6 @@ func newHarness(t *testing.T, mock *mockBot, o *harnessOpts) *harness {
 		t: t, st: st, ing: ing, disp: disp, bot: client, cat: catLk, h: hh, menu: mh,
 		httpHandler: mux,
 	}
-}
-
-// flusher is the Batcher that renders a coalesced batch -> one delivery row -> enqueue.
-type flusher struct {
-	store   *store.Store
-	enqueue func(transport.Delivery)
-	cat     *catalog.Catalog
-}
-
-// Flush implements coalesce.Batcher: resolves the user's destination chat/thread and
-// enqueues a single (possibly batched) delivery. Render display name comes from the store
-// (V-10); severity from the first item in the batch (mirrors main.go batchFlusher).
-func (f *flusher) Flush(ctx context.Context, key coalesce.Key, items []*coalesce.Item) {
-	if len(items) == 0 {
-		return
-	}
-	first := items[0]
-	chatID, threadID := first.UserID, 0
-	if u, err := f.store.GetUser(ctx, first.UserID); err == nil && u != nil && u.DeliveryMode == "group" && u.GroupChatID != nil {
-		chatID = *u.GroupChatID
-		var tid int
-		_ = f.store.QueryRow(ctx, "SELECT message_thread_id FROM group_topics WHERE user_id=? AND service=?", first.UserID, key.Service).Scan(&tid)
-		threadID = tid
-	}
-	sev := first.Severity
-	dispName, _ := f.store.DisplayName(ctx, key.Service)
-	text := ingest.RenderMessage(sev, dispName, key.Type, first.Title, first.Text, first.URL)
-	if len(items) > 1 {
-		text = ingest.RenderBatch(sev, dispName, key.Type, items)
-	}
-	rowID, err := f.store.CreateDelivery(ctx, first.UserID, chatID, threadID, first.EventID, key.Service, key.Type, len(items))
-	if err != nil {
-		return
-	}
-	f.enqueue(transport.Delivery{
-		RowID: rowID, UserID: first.UserID, ChatID: chatID,
-		MessageThreadID: threadID, Text: text, Service: key.Service, BatchSize: len(items),
-	})
 }
 
 // postEvent mimics a service POSTing an event to /v1/events with a token.
